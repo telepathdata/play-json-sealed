@@ -13,12 +13,13 @@
 
 package de.sciss.play.json
 
-import scala.reflect.macros.Context
-import language.experimental.macros
-import play.api.libs.json.{JsError, Writes, JsValue, JsResult, JsMacroImpl, Format, JsSuccess, JsString, JsObject}
-import collection.immutable.{IndexedSeq => Vec}
+import play.api.libs.json.{Format, JsError, JsObject, JsResult, JsString, JsSuccess, JsValue}
 
-object AutoFormat {
+import scala.collection.immutable.{IndexedSeq => Vec}
+import scala.language.experimental.macros
+import scala.reflect.macros.Context
+
+object FlatFormat {
   private val DEBUG   = false
   private val PACKAGE = false
 
@@ -30,27 +31,6 @@ object AutoFormat {
     import c.universe._
     val aTpeW   = c.weakTypeOf[A]
     val aClazz  = aTpeW.typeSymbol.asClass
-
-    // directly support Vec
-    if (aTpeW <:< typeOf[Vec[Any]]) {
-      // cf. stackoverflow nr. 12842729
-      val ta    = aTpeW.asInstanceOf[TypeRefApi].args.head
-      val tree  = q"_root_.de.sciss.play.json.Formats.VecFormat[$ta]"
-      return c.Expr[Format[A]](tree)
-    }
-
-    // directly support Vec
-    if (aTpeW <:< typeOf[(Any, Any)]) {
-      val ta :: tb :: Nil = aTpeW.asInstanceOf[TypeRefApi].args // XXX TODO: doesn't work with type aliases, e.g. type X = (Y, Z)
-      val tree = q"_root_.de.sciss.play.json.Formats.Tuple2Format[$ta, $tb]"
-      return c.Expr[Format[A]](tree)
-    }
-
-    // fall back to Json.format
-    if (!aClazz.isTrait) {
-      if (DEBUG) log(s"Type $aTpeW is not sealed")
-      return JsMacroImpl.formatImpl[A](c)
-    }
 
     def id(s: String) = Ident(newTermName(s))
 
@@ -68,6 +48,7 @@ object AutoFormat {
     }
 
     val subsAll = subs.toList.sortBy(_.name.toString)
+    val knownValues = subsAll.toList.map { _.name.toString }.mkString(",")
     // for each sub type a tuple of writer-case-body, (bool, reader-case-body) where `bool` is true
     // if the sub type is a singleton object and false if it is a case class
     val cases   = subsAll.map { sub =>
@@ -101,19 +82,13 @@ object AutoFormat {
     val (casesWrite, casesRead) = cases.unzip
     val matchWrite      = Match(id("value"), casesWrite)
     val matchWriteExpr  = c.Expr[JsValue](matchWrite)
-    val casesReadC      = casesRead collect { case (false, tree) => tree }
-    val matchReadC      = Match(id("name"), casesReadC) // XXX TODO add catch all
-    val matchReadExprC  = c.Expr[JsResult[A]](matchReadC)
     val casesReadO      = casesRead collect { case (true, tree) => tree }
     val matchReadO      = Match(id("name"), casesReadO) // XXX TODO add catch all
     val matchReadExprO  = c.Expr[JsResult[A]](matchReadO)
+    val validSubs       = c.Expr[JsError](Literal(Constant(knownValues)))
     val r               = reify {
       new Format[A] {
-        private def writeClass[A1](name: String, obj: A1, w: Writes[A1]): JsValue =
-          JsObject(Seq("class" -> JsString(name), "data" -> w.writes(obj)))
-
-        private def writeObject(name: String): JsValue =
-          JsObject(Seq("class" -> JsString(name)))
+        private def writeObject(name: String): JsValue = JsString(name)
 
         def writes(value: A): JsValue = matchWriteExpr.splice
 
@@ -121,17 +96,15 @@ object AutoFormat {
           (json: @unchecked) match {
             // this crashes upon macro expansion (probably a bug)
             // case JsObject(Seq(("class", JsString(name)), rest @ _*)) => ...
-            case JsObject(sq) =>
-              (sq.toList: @unchecked) match {
-                case ("class", JsString(name)) :: tail =>
-                  (tail: @unchecked) match {
-                    case ("data", data) :: Nil  => matchReadExprC.splice
-                    case Nil                    => matchReadExprO.splice
-                  }
-              }
+            case JsString(name) =>
+              matchReadExprO.splice
           }
         } catch {
-          case _: MatchError => JsError(json.toString + " TEST IN AUTOFORMAT")
+          case e: MatchError => JsError(
+            "Unable to parse " + json.toString
+            + " known values are " + validSubs.splice
+            + " " + e.toString
+          )
         }
       }
     }
